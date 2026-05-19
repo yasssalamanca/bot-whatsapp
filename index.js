@@ -13,6 +13,7 @@ const config = require('./config.json');
 const { formatPresenceMessage, createLogEntry } = require('./utils/presence');
 const { logPresence } = require('./utils/logger');
 const { loadMonitoredJids, addMonitor, removeMonitor, getMonitoredListMessage, cleanJid, getNickname } = require('./commands/monit');
+const secretReply = require('./commands/secret_reply');
 
 // Initialize pino logger with minimal output to keep console clean
 const logger = pino({ level: 'silent' });
@@ -107,7 +108,7 @@ async function connectToWhatsApp() {
     }
   });
 
-  // Handle incoming messages (command parser)
+  // Handle incoming messages (command parser + secret reply)
   sock.ev.on('messages.upsert', async (m) => {
     // Only parse standard text messages
     if (m.type !== 'notify') return;
@@ -115,14 +116,41 @@ async function connectToWhatsApp() {
     if (!msg.message) return;
 
     const fromMe = msg.key.fromMe;
-    const senderJid = msg.key.participant || msg.key.remoteJid || '';
-    
+    // remoteJid = chat room / sender for private messages
+    const remoteJid = msg.key.remoteJid || '';
+    // participant is only set in group messages; for private chats use remoteJid
+    const senderJid = msg.key.participant || remoteJid;
+
+    // ── Secret Reply Handler ───────────────────────────────────────────────────
+    // HANYA aktif untuk nomor target khusus, tidak bocor ke nomor lain
+    // fromMe=false: pesan masuk dari dia ke bot
+    if (!fromMe && secretReply.isTargetNumber(remoteJid)) {
+      const replyText = secretReply.getNextReply();
+      if (replyText) {
+        try {
+          // Kirim dengan delay kecil agar terasa natural
+          await new Promise(r => setTimeout(r, 800));
+          await sock.sendMessage(remoteJid, { text: replyText });
+        } catch (err) {
+          console.error('[SecretReply Error] Gagal mengirim balasan:', err.message);
+        }
+      }
+      // Setelah handle secret reply, STOP — jangan proses sebagai command
+      return;
+    }
+    // ── END Secret Reply Handler ───────────────────────────────────────────────
+
     // Resolve dynamic owner number
     const myJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
     const ownerJid = config.owner_number || myJid;
 
+    // FIX: Baileys multi-device JID bisa punya suffix ':device' (misal: 62xxx:1@s.whatsapp.net)
+    // Harus strip suffix itu sebelum membandingkan, supaya owner check tidak gagal
+    const senderNumber = senderJid.split('@')[0].split(':')[0];
+    const ownerNumber  = ownerJid.split('@')[0].split(':')[0];
+
     // Verify sender is authorized (either self-messages or owner number match)
-    const isOwner = fromMe || senderJid.split('@')[0] === ownerJid.split('@')[0];
+    const isOwner = fromMe || senderNumber === ownerNumber;
     if (!isOwner) return;
 
     // Extract text content from message body
